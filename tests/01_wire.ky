@@ -1,0 +1,175 @@
+//! Wire-format conformance tests for the Datastar SSE builders.
+//!
+//! Datastar drives the browser over Server-Sent Events. Every update the server
+//! pushes is one SSE frame: an `event:` line naming the Datastar event type, an
+//! optional `id:` line and `retry:` line, then a run of `data:` lines carrying
+//! the payload, terminated by a blank line. This file pins down the EXACT bytes
+//! that the builders emit for that frame, because the Datastar client parses
+//! them line by line and is unforgiving about spelling, ordering, and the trailing
+//! blank line. A test here is really a snapshot of the on-the-wire contract.
+//!
+//! The builders under test live in three sibling modules and layer cleanly:
+//!
+//!   * [`ds_elements`] and [`ds_signals`] turn a high-level intent (patch this
+//!     HTML fragment, remove this element, merge these signals, run this script)
+//!     into the ordered list of `data:` field lines that intent requires.
+//!   * [`ds_wire.buildFrame`] wraps those `data:` lines in the SSE envelope,
+//!     prepending `event:` and, when supplied, `id:` / `retry:`, and appending
+//!     the terminating blank line.
+//!   * [`ds_const`] holds the frozen constants: the event names
+//!     (`datastar-patch-elements`, `datastar-patch-signals`), the `data:` field
+//!     keywords (`elements`, `selector`, `mode`, `signals`, ...), and the default
+//!     retry interval.
+//!
+//! Each test asserts the fully rendered frame string with [`assert.equalStr`], so
+//! a change anywhere in that stack that alters even one byte of the output, a
+//! missing space after `data:`, a reordered field, a dropped blank line, fails
+//! loudly here rather than silently confusing the client at runtime. The tests
+//! deliberately cover the tricky cases: the default versus explicit patch modes,
+//! multi-line HTML being split across one `data: elements` line per source line,
+//! the signals `onlyIfMissing` flag, script injection, custom `id`/`retry`, and
+//! JavaScript string quoting for redirects.
+
+import assert;
+import list;
+import string;
+import ds_const;
+import ds_wire;
+import ds_elements;
+import ds_signals;
+
+/// The default patch: a single-line HTML fragment merged with the default
+/// options emits just one `data: elements` line and no selector or mode.
+///
+/// This is the baseline case. [`ds_elements.PatchElementOptions.defaults`] means
+/// morph mode against the element's own id, so the frame carries only the event
+/// line and the element payload, confirming that the builder does not emit
+/// redundant `selector` or `mode` lines when they are at their defaults.
+@test
+fn test_patch_elements_simple(): void {
+    let lines = ds_elements.patchElementsLines(
+        "<div id=greeting>hi</div>", ds_elements.PatchElementOptions.defaults());
+    let f = ds_wire.buildFrame(ds_const.EVENT_PATCH_ELEMENTS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    assert.equalStr(f,
+        "event: datastar-patch-elements\ndata: elements <div id=greeting>hi</div>\n\n");
+}
+
+/// A targeted inner patch emits both a `selector` line and a `mode inner` line.
+///
+/// [`ds_elements.PatchElementOptions.inner`] names a CSS selector (`#foo`) and
+/// forces the `inner` merge mode, so the client replaces the target's inner HTML
+/// rather than morphing the element itself. This checks that the selector line
+/// precedes the mode line, which precedes the elements payload, the order the
+/// Datastar client expects.
+@test
+fn test_patch_elements_inner_selector(): void {
+    let lines = ds_elements.patchElementsLines(
+        "<p>x</p>", ds_elements.PatchElementOptions.inner("#foo"));
+    let f = ds_wire.buildFrame(ds_const.EVENT_PATCH_ELEMENTS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    assert.equalStr(f,
+        "event: datastar-patch-elements\ndata: selector #foo\ndata: mode inner\ndata: elements <p>x</p>\n\n");
+}
+
+/// Multi-line HTML is split into one `data: elements` line per source line.
+///
+/// SSE has no notion of an embedded newline inside a single `data:` value, so a
+/// fragment spanning three lines must become three `data: elements` lines. This
+/// verifies that [`ds_elements.patchElementsLines`] performs that split, since a
+/// raw newline in one data line would corrupt the SSE frame.
+@test
+fn test_multiline_elements_split(): void {
+    let lines = ds_elements.patchElementsLines(
+        "<ul>\n<li>a</li>\n</ul>", ds_elements.PatchElementOptions.defaults());
+    let f = ds_wire.buildFrame(ds_const.EVENT_PATCH_ELEMENTS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    assert.equalStr(f,
+        "event: datastar-patch-elements\ndata: elements <ul>\ndata: elements <li>a</li>\ndata: elements </ul>\n\n");
+}
+
+/// Removing an element emits a selector plus `mode remove` and no payload.
+///
+/// [`ds_elements.removeElementLines`] targets the element by selector and sets
+/// the `remove` mode; there is no HTML to send, so the frame carries no
+/// `data: elements` line at all. This confirms the builder omits the payload
+/// entirely for a removal rather than sending an empty one.
+@test
+fn test_remove_element(): void {
+    let lines = ds_elements.removeElementLines("#gone");
+    let f = ds_wire.buildFrame(ds_const.EVENT_PATCH_ELEMENTS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    assert.equalStr(f,
+        "event: datastar-patch-elements\ndata: selector #gone\ndata: mode remove\n\n");
+}
+
+/// A plain signals patch carries the JSON payload on one `data: signals` line.
+///
+/// [`ds_signals.patchSignalsLines`] merges a JSON object into the client's signal
+/// store. With the `onlyIfMissing` flag false there is no `onlyIfMissing` line,
+/// so the frame is just the event line and the signals payload. Note the JSON
+/// braces and quotes pass through verbatim.
+@test
+fn test_patch_signals(): void {
+    let lines = ds_signals.patchSignalsLines("{\"count\":1}", false);
+    let f = ds_wire.buildFrame(ds_const.EVENT_PATCH_SIGNALS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    assert.equalStr(f,
+        "event: datastar-patch-signals\ndata: signals {\"count\":1}\n\n");
+}
+
+/// With `onlyIfMissing` true, an `onlyIfMissing true` line precedes the signals.
+///
+/// Passing true to [`ds_signals.patchSignalsLines`] tells the client to write each
+/// signal only if it is not already set, so existing values are preserved. This
+/// checks that the flag line is emitted before the `data: signals` payload, the
+/// order the client reads them in.
+@test
+fn test_patch_signals_if_missing(): void {
+    let lines = ds_signals.patchSignalsLines("{\"a\":2}", true);
+    let f = ds_wire.buildFrame(ds_const.EVENT_PATCH_SIGNALS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    assert.equalStr(f,
+        "event: datastar-patch-signals\ndata: onlyIfMissing true\ndata: signals {\"a\":2}\n\n");
+}
+
+/// Running a script is expressed as a patch that appends a self-removing
+/// `<script>` to `body`.
+///
+/// Datastar has no dedicated "execute script" event; it reuses the elements
+/// patch. [`ds_elements.scriptElement`] wraps the JavaScript in a `<script>` tag
+/// (the true argument adds `data-effect="el.remove()"` so the tag deletes itself
+/// after running), and [`ds_elements.scriptOptions`] targets `body` in `append`
+/// mode. This test pins down that whole composed frame, including the escaped
+/// quotes inside the script tag.
+@test
+fn test_execute_script_element(): void {
+    let el = ds_elements.scriptElement("console.log(1)", true);
+    let lines = ds_elements.patchElementsLines(el, ds_elements.scriptOptions());
+    let f = ds_wire.buildFrame(ds_const.EVENT_PATCH_ELEMENTS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    assert.equalStr(f,
+        "event: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script data-effect=\"el.remove()\">console.log(1)</script>\n\n");
+}
+
+/// A custom event id and retry interval surface as `id:` and `retry:` lines,
+/// placed before the data.
+///
+/// This drives [`ds_wire.buildFrame`] directly with a hand-built data line, a
+/// non-empty id (`e1`) and a non-default retry (2000 ms). It confirms the
+/// envelope order: `event:` first, then `id:`, then `retry:`, then the `data:`
+/// lines, then the terminating blank line. The `id:` lets the client resume the
+/// stream from a known point, and `retry:` sets its reconnection delay.
+@test
+fn test_id_and_retry_lines(): void {
+    let lines = List<string>();
+    lines.push(ds_wire.dataLine(ds_const.DL_ELEMENTS, "x"));
+    let f = ds_wire.buildFrame(ds_const.EVENT_PATCH_ELEMENTS, lines, "e1", 2000);
+    assert.equalStr(f,
+        "event: datastar-patch-elements\nid: e1\nretry: 2000\ndata: elements x\n\n");
+}
+
+/// JavaScript string quoting wraps a URL in double quotes for safe embedding.
+///
+/// [`ds_elements.jsQuote`] produces a valid JavaScript string literal, which
+/// matters when a URL is dropped into generated script such as a redirect. This
+/// checks that a plain path comes back wrapped in double quotes so the emitted
+/// `window.location.href = "..."` assignment is well formed.
+@test
+fn test_redirect_script_quoting(): void {
+    let js = "window.location.href = " + ds_elements.jsQuote("/dashboard?x=1");
+    assert.equalStr(js, "window.location.href = \"/dashboard?x=1\"");
+}

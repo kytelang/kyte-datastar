@@ -1,0 +1,35 @@
+//! One-shot Datastar patch responses for request/response handlers.
+//!
+//! Datastar's `@get`/`@post` actions consume a Server-Sent Events stream, so an
+//! interactive handler that is NOT a long-lived `app.sse` stream still answers
+//! with a tiny `text/event-stream` body carrying a single `datastar-patch-elements`
+//! frame. The client morphs the fragment into the page by its `id`, then the
+//! response completes. This module builds that response from an NSX/HTML fragment
+//! so application code never hand-writes the SSE envelope.
+//!
+//! It lives in kyte-datastar (rather than a per-app helper) because it is pure
+//! Datastar plumbing: it depends only on the `datastar` generator, the in-memory
+//! `ds_sink.BufferSink`, and the framework `web.response` type.
+
+import web.response;
+import datastar;
+import ds_sink;
+
+/// Wraps `fragment` (which carries its own target `id`) in a one-shot Datastar
+/// patch-elements SSE response.
+///
+/// The fragment is rendered through a [`datastar.Sse`] over an in-memory
+/// [`ds_sink.BufferSink`], producing exactly one `datastar-patch-elements` frame,
+/// which becomes the response body with the `text/event-stream` and `no-cache`
+/// headers the client expects. The client morphs the fragment in by its id and
+/// the response completes; for a live, multi-patch stream use `app.sse` with a
+/// `datastar.Sse.overStreamIO` instead.
+pub async fn patch(fragment: string): response.Response {
+    let buf = ds_sink.BufferSink();
+    let sse = datastar.Sse.overBuffer(buf);
+    let _n = await sse.patchElementsSimple(fragment);
+    let r = response.Response(Status.Ok, buf.contents());
+    r.setHeader("Content-Type", "text/event-stream");
+    r.setHeader("Cache-Control", "no-cache");
+    return r;
+}

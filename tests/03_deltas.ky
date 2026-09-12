@@ -1,0 +1,69 @@
+//! Parity tests for the datastar-go alignment deltas.
+//!
+//! These pin the byte-exact SSE output of the four verbs that were brought into
+//! line with the official datastar-go SDK: the `setTimeout`-wrapped redirect,
+//! `executeScriptWith` custom script attributes, `patchSignalsWith` per-event
+//! options (id/retry/onlyIfMissing), and `marshalAndPatchSignals` over a
+//! `JsonValue`. As with the other wire tests, the assertions compare against a
+//! literal string so any framing drift fails loudly.
+
+import assert;
+import datastar;
+import ds_sink;
+import ds_signals;
+import serde.json;
+import list;
+
+/// `redirect` emits a self-removing `<script>` that defers the navigation with
+/// `setTimeout`, matching datastar-go's `setTimeout(() => window.location.href =
+/// %q)` form. Deferring to the next tick lets the SSE response finish before the
+/// navigation tears the connection down.
+@test
+fn test_redirect_uses_set_timeout(): void {
+    let buf = ds_sink.BufferSink();
+    let sse = datastar.Sse.overBuffer(buf);
+    let _n = sse.redirect("/dashboard?x=1");
+    assert.equalStr(buf.contents(),
+        "event: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script data-effect=\"el.remove()\">setTimeout(() => window.location.href = \"/dashboard?x=1\")</script>\n\n");
+}
+
+/// `executeScriptWith` writes each custom attribute into the `<script>` tag,
+/// before the auto-remove effect. Here auto-remove is off, so only the supplied
+/// `type="module"` attribute appears.
+@test
+fn test_execute_script_with_attributes(): void {
+    let buf = ds_sink.BufferSink();
+    let sse = datastar.Sse.overBuffer(buf);
+    let attrs = List<string>();
+    attrs.push("type=\"module\"");
+    let _n = sse.executeScriptWith("console.log(1)", false, attrs);
+    assert.equalStr(buf.contents(),
+        "event: datastar-patch-elements\ndata: selector body\ndata: mode append\ndata: elements <script type=\"module\">console.log(1)</script>\n\n");
+}
+
+/// `patchSignalsWith` honours the per-event options: a non-empty `eventId` and a
+/// non-default `retryMs` surface as `id:`/`retry:` lines, and `onlyIfMissing`
+/// prepends its data line before the signals payload.
+@test
+fn test_patch_signals_with_options(): void {
+    let buf = ds_sink.BufferSink();
+    let sse = datastar.Sse.overBuffer(buf);
+    let opts = ds_signals.PatchSignalOptions.defaults();
+    opts.onlyIfMissing = true;
+    opts.eventId = "e9";
+    opts.retryMs = 3000;
+    let _n = sse.patchSignalsWith("{\"a\":1}", opts);
+    assert.equalStr(buf.contents(),
+        "event: datastar-patch-signals\nid: e9\nretry: 3000\ndata: onlyIfMissing true\ndata: signals {\"a\":1}\n\n");
+}
+
+/// `marshalAndPatchSignals` stringifies a `JsonValue` and sends it as a
+/// signals patch, so the caller never hand-formats the JSON.
+@test
+fn test_marshal_and_patch_signals(): void {
+    let buf = ds_sink.BufferSink();
+    let sse = datastar.Sse.overBuffer(buf);
+    let _n = sse.marshalAndPatchSignals(json.str("hi"));
+    assert.equalStr(buf.contents(),
+        "event: datastar-patch-signals\ndata: signals \"hi\"\n\n");
+}

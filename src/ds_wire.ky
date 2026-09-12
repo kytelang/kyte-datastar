@@ -1,0 +1,124 @@
+//! Server-Sent Events (SSE) wire encoder for the Datastar package.
+//!
+//! Datastar drives hypermedia updates over a long-lived SSE stream: the server
+//! pushes named events, and each event carries one or more `data:` lines that
+//! the browser runtime interprets (patching elements, patching signals, and so
+//! on). This file is the low layer that turns those pieces into the exact bytes
+//! an SSE consumer expects. It knows nothing about Datastar's semantics; the
+//! higher level modules assemble the event type and the `data:` payload lines,
+//! then hand them here to be framed.
+//!
+//! The SSE framing rules this encoder implements come straight from the
+//! `text/event-stream` format: each field is written as `field: value\n`, the
+//! recognised fields are `event`, `id`, `retry`, and `data`, and a single blank
+//! line (an extra `\n`) terminates the event so the client dispatches it. An
+//! event may carry several `data:` lines, which the client joins with newlines
+//! into one payload. See [`buildFrame`] for the assembly and ordering.
+//!
+//! Two deliberate design decisions are worth calling out. First, optional
+//! fields are omitted rather than sent empty: an absent `id` and a `retry` that
+//! equals the protocol default ([`ds_const.DEFAULT_RETRY_MS`]) are simply not
+//! written, keeping each frame as small as possible on a stream that stays open
+//! for the life of the page. Second, the integer to text conversion is done by
+//! a small hand-rolled routine ([`intToStr`]) rather than pulling in a heavier
+//! formatting path, since the only number this file ever emits is the retry
+//! interval.
+
+import string;
+import list;
+import bytes;
+import collections.string_builder;
+import ds_const;
+
+/// Formats a non-negative `int` as its base-10 decimal `string`.
+///
+/// A minimal, allocation-lean integer to text routine used only for the SSE
+/// `retry:` value, so it intentionally handles just the cases that field needs.
+/// It special-cases zero, then counts the decimal digits, allocates a buffer of
+/// exactly that many bytes, and fills it back to front by repeatedly taking the
+/// last digit (`n % 10`) and adding 48, the ASCII code for `'0'`. The buffer is
+/// reinterpreted as a `string` with no copy. It assumes `val` is not negative;
+/// a negative input would not produce a leading minus sign, but the only caller
+/// ([`buildFrame`]) passes a millisecond retry value which is never negative.
+pub fn intToStr(val: int): string {
+    if (val == 0) { return "0"; }
+    let n = val;
+    let digits = 0;
+    while (n > 0) { digits = digits + 1; n = n / 10; }
+    let p = bytes.alloc(digits);
+    let i = digits - 1;
+    n = val;
+    while (i >= 0) {
+        bytes.write_byte(p, i, (n % 10) + 48);
+        n = n / 10;
+        i = i - 1;
+    }
+    return p as string;
+}
+
+/// Joins a Datastar data-line key with its value into one payload line.
+///
+/// A Datastar `data:` line is composed of a key prefix (for example the
+/// `selector `, `mode `, or `elements ` constants in [`ds_const`], each of which
+/// already ends in a trailing space) followed by the value. This helper is just
+/// that concatenation, kept as a named function so callers assembling the list
+/// of data lines read clearly and so the shape stays in one place. Note it does
+/// NOT prepend the SSE `data: ` field marker or append the newline; that framing
+/// is added later by [`buildFrame`] when each element of the list is written.
+pub fn dataLine(key: string, val: string): string {
+    return key + val;
+}
+
+/// Encodes one complete SSE event into a single ready-to-write `string`.
+///
+/// The frame is assembled in the order an SSE parser expects: the `event:` line
+/// first, then an optional `id:` line, then an optional `retry:` line, then one
+/// `data:` line per entry in `dataLines`, and finally a blank line that
+/// terminates the event so the browser dispatches it.
+///
+/// Optional fields are elided to keep the stream lean: the `id:` line is written
+/// only when `eventId` is non-empty, and the `retry:` line only when `retryMs`
+/// differs from [`ds_const.DEFAULT_RETRY_MS`], since re-sending the default on
+/// every frame would waste bytes on a connection that stays open. Each entry of
+/// `dataLines` is expected to be a fully composed payload (typically built with
+/// [`dataLine`]); this function wraps it with the `data: ` marker and a newline.
+/// A null entry, which `List.get` surfaces as an optional, is treated as an
+/// empty payload via `?? ""` so a gap in the list never aborts the frame.
+///
+/// Building goes through a [`string_builder.StringBuilder`] to avoid repeated
+/// intermediate string allocations. The builder is explicitly freed with
+/// `sb.delete()` before returning, after its contents have been materialised
+/// into the owned `out` string, so no builder memory outlives the call.
+pub fn buildFrame(eventType: string, dataLines: List<string>, eventId: string, retryMs: int): string {
+    let sb = string_builder.StringBuilder();
+
+    sb.append("event: ");
+    sb.append(eventType);
+    sb.append("\n");
+
+    if (eventId != "") {
+        sb.append("id: ");
+        sb.append(eventId);
+        sb.append("\n");
+    }
+
+    if (retryMs != ds_const.DEFAULT_RETRY_MS) {
+        sb.append("retry: ");
+        sb.append(intToStr(retryMs));
+        sb.append("\n");
+    }
+
+    let i = 0;
+    while (i < dataLines.size()) {
+        sb.append("data: ");
+        sb.append(dataLines.get(i) ?? "");
+        sb.append("\n");
+        i = i + 1;
+    }
+
+    sb.append("\n");
+
+    let out = sb.toString();
+    sb.delete();
+    return out;
+}

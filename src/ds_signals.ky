@@ -1,0 +1,114 @@
+//! Datastar signal plumbing: the two halves of the signal round trip.
+//!
+//! Datastar is a hypermedia framework where the browser keeps a small bag of
+//! reactive state called "signals" (a flat JSON object), and the server steers
+//! the UI by patching that bag over a Server-Sent Events (SSE) stream. This file
+//! sits at the exact interface between Kyte's web request/response machinery and the
+//! Datastar wire format, and it does only two things: it turns an outgoing
+//! signals patch into SSE data lines, and it pulls the client's current signals
+//! back out of an incoming request.
+//!
+//! WHY it is split out from the frame builder: the SSE envelope itself (the
+//! `event:`, `id:`, `retry:` and `data:` framing) lives in [`ds_wire`], and the
+//! literal field prefixes live in [`ds_const`]. Keeping the signal-specific
+//! shaping here means the transport code stays generic and the protocol strings
+//! stay in one place, so a change to a Datastar field name touches exactly one
+//! constant and never this logic.
+//!
+//! The subtle bit is the asymmetry in how signals travel. Server to client, a
+//! patch is one or more `signals` data lines carrying JSON (see
+//! [`patchSignalsLines`]). Client to server, Datastar does NOT put the signals
+//! in the same place for every verb: a GET or DELETE cannot carry a body, so the
+//! signals ride in a `datastar` query parameter, whereas a POST/PUT/PATCH sends
+//! them as the request body. [`readSignalsRaw`] hides that split so callers can
+//! read the signals without caring which verb delivered them.
+
+import string;
+import list;
+import web.request;
+import ds_const;
+import ds_wire;
+
+/// The set of knobs for a single `datastar-patch-signals` event.
+///
+/// A value struct mirroring [`ds_elements.PatchElementOptions`] on the signals
+/// side, so a caller can override the per-event id and reconnection hint the way
+/// datastar-go's `WithPatchSignalsEventID` / `WithPatchSignalsRetryDuration`
+/// options allow. `onlyIfMissing` selects whether the patch seeds defaults or
+/// overwrites. Construct it with [`PatchSignalOptions.defaults`] and set the
+/// fields you need, since they are all public.
+pub struct PatchSignalOptions {
+    /// When true, the client writes a signal only where it does not already hold
+    /// a value (seed defaults rather than overwrite). Emitted as the
+    /// `onlyIfMissing` data line only when true.
+    pub onlyIfMissing: bool,
+    /// SSE event id for this event, used by the client to resume via
+    /// `Last-Event-ID`. Empty to omit the `id:` line.
+    pub eventId: string,
+    /// Reconnection hint in milliseconds. Seeded from `ds_const.DEFAULT_RETRY_MS`;
+    /// the wire layer omits the `retry:` line when it equals the default.
+    pub retryMs: int,
+
+    /// Builds an options value with every field at its neutral default:
+    /// overwrite mode (`onlyIfMissing` false), no event id, default retry.
+    pub fn defaults(): PatchSignalOptions {
+        return PatchSignalOptions{
+            onlyIfMissing: false,
+            eventId: "",
+            retryMs: ds_const.DEFAULT_RETRY_MS,
+        };
+    }
+}
+
+/// Builds the `data:` lines for a Datastar "patch signals" SSE event.
+///
+/// The input is the signals patch already rendered as JSON. Datastar's SSE
+/// framing carries one logical JSON blob split across one `signals` data line
+/// per source text line, so this splits `signalsJson` on newlines and emits a
+/// [`ds_const.DL_SIGNALS`]-prefixed line for each part. A JSON blob with no
+/// embedded newline therefore yields exactly one line.
+///
+/// When `onlyIfMissing` is true, an [`ds_const.DL_ONLY_IF_MISSING`] line with
+/// value `"true"` is prepended first. That tells the Datastar client to write a
+/// signal only where it does not already hold a value, i.e. treat the patch as
+/// defaults rather than overrides, which is how server-supplied initial state
+/// avoids clobbering values the user has since changed.
+///
+/// The returned list is the ordered set of data lines ready to hand to
+/// [`ds_wire.buildFrame`]; it does not include the surrounding `event:`/`id:`
+/// envelope. An empty split part is passed through as an empty string via the
+/// `?? ""` guard rather than being dropped, so line positions are preserved.
+pub fn patchSignalsLines(signalsJson: string, onlyIfMissing: bool): List<string> {
+    let lines = List<string>();
+    if (onlyIfMissing) {
+        lines.push(ds_wire.dataLine(ds_const.DL_ONLY_IF_MISSING, "true"));
+    }
+    let parts = string.split(signalsJson, "\n");
+    let i = 0;
+    while (i < parts.size()) {
+        lines.push(ds_wire.dataLine(ds_const.DL_SIGNALS, parts.get(i) ?? ""));
+        i = i + 1;
+    }
+    return lines;
+}
+
+/// Reads the client's current signals off an incoming request as raw JSON.
+///
+/// This absorbs Datastar's verb-dependent delivery: a GET or DELETE carries no
+/// body, so the signals arrive in the [`ds_const.DATASTAR_KEY`] (`"datastar"`)
+/// query parameter, while every other verb sends them in the request body. The
+/// method is matched case-sensitively against the literal `"GET"` and `"DELETE"`
+/// strings, so callers must pass through the request's method verbatim.
+///
+/// Returns the JSON text exactly as received, with no parsing or validation. If
+/// a GET or DELETE arrives without the `datastar` query parameter, the `?? ""`
+/// guard yields the empty string rather than failing, so the caller sees "no
+/// signals" instead of an error. The counterpart to this reader on the outbound
+/// side is [`patchSignalsLines`].
+pub fn readSignalsRaw(req: request.Request): string {
+    let m = req.method;
+    if (string.eql(m, "GET") || string.eql(m, "DELETE")) {
+        return req.query.get(ds_const.DATASTAR_KEY) ?? "";
+    }
+    return req.body;
+}

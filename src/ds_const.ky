@@ -1,0 +1,132 @@
+//! Wire-protocol constants for the Datastar SSE integration.
+//!
+//! Datastar is a hypermedia framework that drives the browser from the server
+//! over a plain Server-Sent Events (SSE) stream. The server does not send a
+//! bespoke JSON envelope; it sends ordinary SSE frames whose `event:` type and
+//! `data:` lines follow a small, fixed vocabulary that the Datastar client
+//! library understands. This file is the single, authoritative home for that
+//! vocabulary: the event names, the element patch modes, the DOM namespaces,
+//! the per-line `data:` key prefixes, and the defaults the client assumes.
+//!
+//! Why keep these as named constants in one place rather than sprinkling string
+//! literals through the SSE writer? Two reasons. First, they are a CONTRACT with
+//! a third-party client: every value here has to match what the Datastar
+//! JavaScript expects byte for byte, so a typo would not fail to compile, it
+//! would silently produce frames the browser ignores. Centralising them makes
+//! that contract auditable in one screen. Second, the SSE writer emits these
+//! tokens on the hot path for every streamed patch, and referring to a shared
+//! `const` keeps the emit sites readable and impossible to drift out of sync.
+//!
+//! A note on the trailing spaces in the `DL_*` prefixes: a Datastar `data:` line
+//! is written as `data: <key> <value>`, so each key constant carries its own
+//! separating space (for example `"selector "`) and the writer concatenates the
+//! value directly after it. The space is part of the token deliberately, not an
+//! accident; do not trim it. See the SSE writer that pairs with this file for
+//! how the frames are assembled, and the surrounding `kyte-datastar` package for
+//! the higher-level patch API that chooses which of these tokens to emit.
+
+/// SSE `event:` type that carries an HTML element patch to the DOM.
+///
+/// Frames tagged with this event name update, insert, or remove elements in the
+/// live document; the accompanying `data:` lines use the `DL_SELECTOR`,
+/// `DL_MODE`, `DL_ELEMENTS` and related prefixes to say where and how. Pairs
+/// with [`EVENT_PATCH_SIGNALS`], which carries state rather than markup.
+pub const EVENT_PATCH_ELEMENTS: string = "datastar-patch-elements";
+/// SSE `event:` type that carries a patch to the client-side signal store.
+///
+/// Signals are Datastar's reactive state values; a frame of this type updates
+/// them (see [`DL_SIGNALS`] and [`DL_ONLY_IF_MISSING`]) without touching the DOM
+/// directly. Pairs with [`EVENT_PATCH_ELEMENTS`].
+pub const EVENT_PATCH_SIGNALS: string  = "datastar-patch-signals";
+
+/// Patch mode: replace the target element's entire outer HTML.
+///
+/// The default mode (see [`DEFAULT_MODE`]). The incoming markup takes the place
+/// of the matched element itself, tag and all.
+pub const MODE_OUTER: string   = "outer";
+/// Patch mode: replace only the target's inner HTML, keeping the element itself.
+pub const MODE_INNER: string   = "inner";
+/// Patch mode: remove the target element from the document entirely.
+pub const MODE_REMOVE: string  = "remove";
+/// Patch mode: replace the target element with the supplied markup.
+pub const MODE_REPLACE: string = "replace";
+/// Patch mode: insert the markup as the first children inside the target.
+pub const MODE_PREPEND: string = "prepend";
+/// Patch mode: insert the markup as the last children inside the target.
+pub const MODE_APPEND: string  = "append";
+/// Patch mode: insert the markup immediately before the target element.
+pub const MODE_BEFORE: string  = "before";
+/// Patch mode: insert the markup immediately after the target element.
+pub const MODE_AFTER: string   = "after";
+
+/// DOM namespace token for ordinary HTML elements (the default).
+///
+/// Sent via [`DL_NAMESPACE`] so the client parses the patched markup in the
+/// right namespace. See also [`NS_SVG`] and [`NS_MATHML`].
+pub const NS_HTML: string   = "html";
+/// DOM namespace token for SVG elements, so patched markup parses as SVG.
+pub const NS_SVG: string    = "svg";
+/// DOM namespace token for MathML elements, so patched markup parses as MathML.
+pub const NS_MATHML: string = "mathml";
+
+/// Default patch mode assumed when a frame omits [`DL_MODE`].
+///
+/// Equal in value to [`MODE_OUTER`]; kept as a separate named default so the
+/// writer can decide whether to emit an explicit mode line at all. When the mode
+/// matches this, the line can be left out and the client falls back to the same
+/// behaviour.
+pub const DEFAULT_MODE: string  = "outer";
+/// Default SSE reconnection delay, in milliseconds, advertised to the client.
+///
+/// Emitted as the SSE `retry:` field so that if the stream drops, the browser
+/// waits this long before reconnecting. One second is the Datastar default.
+pub const DEFAULT_RETRY_MS: int = 1000;
+
+/// `data:` line prefix naming the CSS selector for the target element(s).
+///
+/// The value written after this prefix is a CSS selector string. Note the
+/// trailing space: the writer concatenates the selector straight after it, so
+/// the emitted line reads `data: selector <css>`. See the file header for why
+/// the space belongs to the token.
+pub const DL_SELECTOR: string             = "selector ";
+/// `data:` line prefix naming the patch mode (one of the `MODE_*` values).
+///
+/// Trailing space is intentional; see [`DL_SELECTOR`].
+pub const DL_MODE: string                 = "mode ";
+/// `data:` line prefix naming the DOM namespace (one of the `NS_*` values).
+///
+/// Trailing space is intentional; see [`DL_SELECTOR`].
+pub const DL_NAMESPACE: string            = "namespace ";
+/// `data:` line prefix toggling a View Transition around the patch.
+///
+/// The value is a boolean flag telling the client to wrap the DOM change in a
+/// browser View Transition. Trailing space is intentional; see [`DL_SELECTOR`].
+pub const DL_USE_VIEW_TRANSITION: string  = "useViewTransition ";
+/// `data:` line prefix naming the selector scoped to the View Transition.
+///
+/// Trailing space is intentional; see [`DL_SELECTOR`].
+pub const DL_VIEW_TRANSITION_SEL: string  = "viewTransitionSelector ";
+/// `data:` line prefix carrying a line of the HTML element markup to patch.
+///
+/// Multi-line markup is emitted as several `data: elements ...` lines, one per
+/// source line, per the SSE framing. Trailing space is intentional; see
+/// [`DL_SELECTOR`].
+pub const DL_ELEMENTS: string             = "elements ";
+/// `data:` line prefix carrying the JSON payload of a signals patch.
+///
+/// Used with [`EVENT_PATCH_SIGNALS`]; the value is the JSON describing which
+/// signals to set. Trailing space is intentional; see [`DL_SELECTOR`].
+pub const DL_SIGNALS: string              = "signals ";
+/// `data:` line prefix telling the client to set a signal only if it is unset.
+///
+/// A boolean flag on a signals patch: when true, existing signal values are left
+/// untouched and only missing ones are initialised. Trailing space is
+/// intentional; see [`DL_SELECTOR`].
+pub const DL_ONLY_IF_MISSING: string      = "onlyIfMissing ";
+
+/// Reserved key under which Datastar namespaces its client-side state.
+///
+/// Used as the well-known top-level key (for example in the signal store and in
+/// generated attribute names) so Datastar's own bookkeeping does not collide
+/// with application data.
+pub const DATASTAR_KEY: string = "datastar";

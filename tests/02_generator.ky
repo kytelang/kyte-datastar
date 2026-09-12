@@ -1,0 +1,95 @@
+//! Generator tests for the Datastar SSE writer.
+//!
+//! Datastar is a hypermedia framework: the server drives the browser by
+//! streaming Server-Sent Events (SSE) that patch DOM elements and client-side
+//! signals. This test file exercises `datastar.Sse`, the Kyte object that
+//! serialises those patch operations into the exact SSE wire format the
+//! Datastar client expects.
+//!
+//! The point of these tests is to pin down the BYTE-EXACT output. An SSE frame
+//! is whitespace and newline sensitive: each event is an `event:` line, one or
+//! more `data:` lines, then a blank line to terminate the frame. A stray space,
+//! a missing `\n`, or a wrong field name silently breaks the client, so the
+//! assertions here compare the emitted text against a literal string rather
+//! than parsing it back. If the writer's framing ever drifts, one of these
+//! equality checks fails loudly.
+//!
+//! The `Sse` writer is deliberately decoupled from its output target. It writes
+//! through a sink, so these tests drive it over `ds_sink.BufferSink`, an
+//! in-memory buffer whose accumulated bytes can be read back with
+//! `contents()`. That keeps the assertions synchronous and free of any socket
+//! or reactor. One case also constructs the writer over a live
+//! `aio.AsyncStream` to prove the streaming constructor type-checks and links,
+//! without actually sending anything over the network.
+//!
+//! Run with `kyte test` from the kyte-datastar package. See the `datastar`
+//! module for the `Sse` implementation and `ds_sink` for the sink interface.
+
+import assert;
+import datastar;
+import ds_sink;
+import net.aio;
+
+/// Constructing an `Sse` over a fresh buffer must not emit any bytes.
+///
+/// The writer only produces output when a patch method is called, so a
+/// just-constructed writer over an empty [`ds_sink.BufferSink`] leaves the
+/// buffer empty. This guards against the constructor accidentally writing a
+/// preamble or handshake into the stream.
+@test
+fn test_construct_over_buffer(): void {
+    let buf = ds_sink.BufferSink();
+    let sse = datastar.Sse.overBuffer(buf);
+    assert.equalStr(buf.contents(), "");
+}
+
+/// A single `patchElementsSimple` call must produce one exact SSE frame.
+///
+/// This is the core round-trip: the writer takes an HTML fragment and emits a
+/// `datastar-patch-elements` event whose `data:` line carries the `elements`
+/// keyword followed by the markup, terminated by the mandatory blank line. The
+/// assertion compares against the literal wire string so any change in field
+/// name, spacing, or newline framing is caught immediately.
+@test
+fn test_roundtrip_patch_elements(): void {
+    let buf = ds_sink.BufferSink();
+    let sse = datastar.Sse.overBuffer(buf);
+    let n = sse.patchElementsSimple("<div id=g>hi</div>");
+    assert.equalStr(buf.contents(),
+        "event: datastar-patch-elements\ndata: elements <div id=g>hi</div>\n\n");
+}
+
+/// Two patch calls must append their frames back to back in the buffer.
+///
+/// The writer holds no per-event state between calls, so writing a
+/// `patchSignals` frame (a `datastar-patch-signals` event carrying a JSON
+/// signals payload) followed by a `removeElement` frame (a
+/// `datastar-patch-elements` event with a CSS selector and `mode remove`) must
+/// yield the exact concatenation of the two independent frames, each ending in
+/// its own blank line. This confirms the sink accumulates rather than
+/// overwriting, and that a second event does not disturb the first.
+@test
+fn test_roundtrip_two_events_concat(): void {
+    let buf = ds_sink.BufferSink();
+    let sse = datastar.Sse.overBuffer(buf);
+    let a = sse.patchSignals("{\"n\":1}");
+    let b = sse.removeElement("#old");
+    assert.equalStr(buf.contents(),
+        "event: datastar-patch-signals\ndata: signals {\"n\":1}\n\n"
+        + "event: datastar-patch-elements\ndata: selector #old\ndata: mode remove\n\n");
+}
+
+/// The streaming constructor must accept a live `AsyncStream` and link.
+///
+/// `Sse.overStream` is the production path that writes SSE frames straight to a
+/// network stream rather than an in-memory buffer. This case only proves that
+/// the writer can be constructed over an [`aio.AsyncStream`] (built here on a
+/// zero file descriptor) and that the overload type-checks and compiles; it
+/// sends nothing and asserts a trivial truth. The byte-exact behaviour is
+/// covered by the buffer-backed cases above, which share the same writer.
+@test
+fn test_construct_over_stream(): void {
+    let s = aio.AsyncStream(0 as long);
+    let sse = datastar.Sse.overStream(s);
+    assert.isTrue(true);
+}

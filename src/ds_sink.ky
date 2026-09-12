@@ -1,0 +1,136 @@
+//! Output sinks for the Datastar Server-Sent Events (SSE) writer.
+//!
+//! Datastar drives a hypermedia UI by streaming SSE events from the server to
+//! the browser. Every event is ultimately a run of already-encoded text (the
+//! `event:` / `data:` lines plus the terminating blank line) that has to reach
+//! somewhere. This file defines the ONE interface that the rest of the package
+//! renders into: [`SseSink`], a tiny async interface with a single method,
+//! [`SseSink.writeChunk`]. The event builders in the package never touch a
+//! socket directly; they format a chunk of SSE text and hand it to whatever
+//! sink they were given.
+//!
+//! Keeping that interface narrow buys two things. First, the same event-building
+//! code serves a live HTTP response and a test harness without any branching:
+//! swap the sink, not the caller. Second, `writeChunk` is `async`, so the live
+//! path can back-pressure naturally. A slow client makes the underlying
+//! [`aio.AsyncStream.sendStr`] suspend, which suspends the coroutine that was
+//! producing events, so the server does not run ahead of a browser that cannot
+//! keep up. There is no internal buffering or queueing here to leak or overflow.
+//!
+//! Two concrete sinks ship with the package:
+//!
+//!   1. [`StreamSink`], the production path, which writes each chunk straight
+//!      to a borrowed async network stream.
+//!   2. [`BufferSink`], the test and capture path, which accumulates chunks in
+//!      a [`string_builder.StringBuilder`] so a test can assert on the exact
+//!      bytes that would have gone on the wire, with no socket in sight.
+//!
+//! Both return the number of bytes accepted from the chunk, matching the
+//! convention of the underlying write, so a caller can tell how much actually
+//! landed.
+
+import net.aio;
+import collections.string_builder;
+
+/// The single output interface that the Datastar SSE writer renders into.
+///
+/// An `SseSink` is anything that can accept one already-encoded chunk of SSE
+/// text. The method is `async` on purpose: the live implementation writes to a
+/// socket and must be able to suspend when the client is slow, which propagates
+/// back-pressure to the event producer rather than buffering without bound.
+/// Implementors return how many bytes of the chunk were accepted. See
+/// [`StreamSink`] for the network path and [`BufferSink`] for the in-memory
+/// capture path.
+pub trait SseSink {
+    /// Writes one chunk of encoded SSE text to the sink, returning the number
+    /// of bytes accepted.
+    ///
+    /// May suspend: the network implementation awaits the underlying send, so a
+    /// slow consumer parks the caller here instead of racing ahead.
+    async fn writeChunk(self: SseSink, data: string): int;
+}
+
+/// An [`SseSink`] that writes each chunk straight to a live async network stream.
+///
+/// This is the production path: the stream is the client's HTTP response
+/// connection during an SSE session. The sink only borrows the stream; it does
+/// not own or close it, since the response's lifecycle is managed by the web
+/// framework around it.
+pub struct StreamSink impl SseSink {
+    /// The borrowed async stream that chunks are written to. Typically the
+    /// client's open HTTP response connection for the duration of the SSE stream.
+    pub stream: aio.AsyncStream,
+
+    /// Wraps an already-open async stream as a sink. The caller retains
+    /// ownership of `s` and is responsible for its eventual close.
+    init(s: aio.AsyncStream) {
+        self.stream = s;
+    }
+
+    /// Sends the chunk on the underlying stream and returns the byte count it
+    /// accepted.
+    ///
+    /// Awaits [`aio.AsyncStream.sendStr`], so this suspends until the bytes are
+    /// handed to the transport; a slow client therefore back-pressures the event
+    /// producer through this await instead of the package queueing internally.
+    pub async fn writeChunk(self: StreamSink, data: string): int {
+        return await self.stream.sendStr(data);
+    }
+}
+
+/// An [`SseSink`] over the `aio.AsyncIO` trait rather than the concrete
+/// `AsyncStream`.
+///
+/// This is what a web framework uses when it hands a streaming handler the
+/// connection as an `AsyncIO` (which also covers a TLS-wrapped stream). It only
+/// borrows the connection; the framework owns its lifecycle.
+pub struct IoSink impl SseSink {
+    /// The borrowed connection that chunks are written to.
+    pub io: aio.AsyncIO,
+
+    init(io: aio.AsyncIO) {
+        self.io = io;
+    }
+
+    pub async fn writeChunk(self: IoSink, data: string): int {
+        return await self.io.sendStr(data);
+    }
+}
+
+/// An [`SseSink`] that accumulates every chunk in memory instead of on a socket.
+///
+/// This is the test and capture path. It lets a test drive the exact same event
+/// builders as production and then read back the complete SSE byte stream via
+/// [`BufferSink.contents`] to assert on it, with no network involved. It never
+/// suspends and never applies back-pressure, so it also serves as a way to
+/// render a whole response to a string in one go.
+pub struct BufferSink impl SseSink {
+    /// The growable buffer that every written chunk is appended to, in order.
+    pub sb: string_builder.StringBuilder,
+
+    /// Creates an empty sink with a fresh, empty backing buffer.
+    init() {
+        self.sb = string_builder.StringBuilder();
+    }
+
+    /// Appends the chunk to the in-memory buffer and reports its length as the
+    /// bytes accepted.
+    ///
+    /// Always accepts the whole chunk and never suspends, so unlike
+    /// [`StreamSink.writeChunk`] it applies no back-pressure. The returned count
+    /// is simply `data.length`.
+    pub async fn writeChunk(self: BufferSink, data: string): int {
+        self.sb.append(data);
+        return data.length;
+    }
+
+    /// Returns everything written so far as a single owned `string`.
+    ///
+    /// The result is the concatenation of every chunk passed to
+    /// [`BufferSink.writeChunk`], in the order they arrived, which is exactly the
+    /// byte stream that would have gone on the wire. Intended for assertions in
+    /// tests.
+    pub fn contents(self: BufferSink): string {
+        return self.sb.toString();
+    }
+}

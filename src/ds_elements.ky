@@ -1,0 +1,263 @@
+//! Datastar `patch-elements` and `remove-elements` event builders.
+//!
+//! Datastar is a hypermedia framework: the server pushes small fragments of
+//! HTML to the browser over Server-Sent Events (SSE), and the client library
+//! patches them into the live DOM. This file is the piece of the kyte-datastar
+//! driver that turns a fragment of HTML (plus a few options) into the ordered
+//! set of `data:` lines that make up one such SSE event. It does NOT write the
+//! `event:` header or the trailing blank line; it produces only the body lines,
+//! which the wire layer (`ds_wire`) frames into a complete SSE event.
+//!
+//! Two element operations live here. A `patch-elements` event carries a chunk
+//! of HTML together with a CSS selector and a merge mode (inner, append, and so
+//! on) that tell the client WHERE and HOW to splice the markup in. A
+//! `remove-elements` event carries just a selector and the special remove mode,
+//! asking the client to delete the matching nodes.
+//!
+//! The design leans on a few decisions worth stating up front:
+//!
+//!   1. Options are gathered in one value struct, [`PatchElementOptions`], with
+//!      named factory helpers rather than a long positional constructor. The
+//!      builder emits a `data:` line for an option ONLY when it departs from the
+//!      Datastar default, so the common case sends the smallest possible event.
+//!   2. The HTML payload may span several source lines. SSE forbids a raw
+//!      newline inside one `data:` field, so [`patchElementsLines`] splits the
+//!      markup on `\n` and emits one `elements` line per source line. The client
+//!      reassembles them.
+//!   3. Constants for the field names, modes, and defaults live in `ds_const`,
+//!      so the strings that go on the wire are defined once and shared with the
+//!      rest of the driver.
+//!
+//! There is also a small script-injection convenience: [`scriptElement`] wraps
+//! JavaScript in a `<script>` tag (optionally self-removing after it runs) so it
+//! can be delivered as an element patch, and [`jsQuote`] renders a Kyte string
+//! as a safe double-quoted JavaScript string literal for embedding in such
+//! scripts.
+
+import string;
+import list;
+import collections.string_builder;
+import ds_const;
+import ds_wire;
+
+/// The set of knobs for a single `patch-elements` event.
+///
+/// This is a value struct: it is passed around by value and holds only plain
+/// fields, no owned handles. Construct it with one of the factory helpers
+/// ([`PatchElementOptions.defaults`], [`PatchElementOptions.inner`],
+/// [`PatchElementOptions.withSelector`]) rather than by hand, so every field
+/// gets a defined starting value. [`patchElementsLines`] reads these fields and
+/// emits a `data:` line for each one that differs from the Datastar default.
+pub struct PatchElementOptions {
+    /// CSS selector naming the target element(s) the patch applies to. An empty
+    /// string means the client uses the id of the incoming element instead, so
+    /// no selector line is emitted.
+    pub selector: string,
+    /// Merge mode: how the client splices the markup relative to the target,
+    /// for example inner, append, or remove. An empty string, or a value equal
+    /// to the Datastar default mode, is left off the wire.
+    pub mode: string,
+    /// Optional XML/SVG namespace for the patched nodes. Emitted only when set;
+    /// needed when patching inside foreign-content elements such as `<svg>`.
+    pub namespace: string,
+    /// When true, ask the browser to run the patch inside a View Transition so
+    /// the change animates. Emitted as a `true` line only when enabled.
+    pub useViewTransition: bool,
+    /// Optional selector scoping which part of the page participates in the View
+    /// Transition. Emitted only when non-empty and typically paired with
+    /// [`PatchElementOptions.useViewTransition`].
+    pub viewTransitionSelector: string,
+    /// SSE event id for this event, used by the client to resume the stream via
+    /// `Last-Event-ID` after a reconnect. Note: this field is carried on the
+    /// options but framed by the wire layer, not by [`patchElementsLines`].
+    pub eventId: string,
+    /// Reconnection hint in milliseconds handed to the browser's EventSource.
+    /// Seeded from `ds_const.DEFAULT_RETRY_MS`. Like `eventId`, it is applied by
+    /// the wire framing rather than emitted as an element `data:` line here.
+    pub retryMs: int,
+
+    /// Builds an options value with every field at its neutral default.
+    ///
+    /// selector, mode, namespace, and the two transition strings start empty;
+    /// `useViewTransition` starts false; `retryMs` starts at the driver-wide
+    /// default `ds_const.DEFAULT_RETRY_MS`. This is the base that the other
+    /// factory helpers customise.
+    pub fn defaults(): PatchElementOptions {
+        return PatchElementOptions{
+            selector: "",
+            mode: "",
+            namespace: "",
+            useViewTransition: false,
+            viewTransitionSelector: "",
+            eventId: "",
+            retryMs: ds_const.DEFAULT_RETRY_MS,
+        };
+    }
+
+    /// Options that patch into the INNER HTML of the target `selector`.
+    ///
+    /// Starts from [`PatchElementOptions.defaults`], sets the selector, and
+    /// fixes the mode to `ds_const.MODE_INNER` so the client replaces the
+    /// contents of the matched element rather than the element itself.
+    pub fn inner(selector: string): PatchElementOptions {
+        let o = PatchElementOptions.defaults();
+        o.selector = selector;
+        o.mode = ds_const.MODE_INNER;
+        return o;
+    }
+    /// Options carrying just a target `selector`, with the default merge mode.
+    ///
+    /// Starts from [`PatchElementOptions.defaults`] and sets only the selector,
+    /// leaving mode empty so the Datastar default applies. Use this when the
+    /// default mode is what you want and you only need to name the target.
+    pub fn withSelector(selector: string): PatchElementOptions {
+        let o = PatchElementOptions.defaults();
+        o.selector = selector;
+        return o;
+    }
+}
+
+/// Builds the ordered `data:` body lines for one `patch-elements` SSE event.
+///
+/// The option lines come first, then the HTML payload. An option line is
+/// emitted ONLY when the field departs from the Datastar default, keeping the
+/// event as small as possible: the selector line is skipped when empty, the
+/// mode line is skipped when empty or equal to `ds_const.DEFAULT_MODE`, the
+/// namespace and view-transition-selector lines are skipped when empty, and the
+/// use-view-transition line appears only when the flag is set.
+///
+/// The `elements` markup is split on `\n` and each source line becomes its own
+/// `elements` line, because SSE does not permit a raw newline within a single
+/// `data:` field; the client stitches the lines back together. An empty split
+/// part (for example from a trailing newline) is emitted as an empty payload
+/// via the `?? ""` fallback on the list access. The returned list holds the
+/// body only; `eventId` and `retryMs` are applied later by the wire framing,
+/// not here.
+pub fn patchElementsLines(elements: string, opts: PatchElementOptions): List<string> {
+    let lines = List<string>();
+
+    if (opts.selector != "") {
+        lines.push(ds_wire.dataLine(ds_const.DL_SELECTOR, opts.selector));
+    }
+    if (opts.mode != "" && !string.eql(opts.mode, ds_const.DEFAULT_MODE)) {
+        lines.push(ds_wire.dataLine(ds_const.DL_MODE, opts.mode));
+    }
+    if (opts.namespace != "") {
+        lines.push(ds_wire.dataLine(ds_const.DL_NAMESPACE, opts.namespace));
+    }
+    if (opts.useViewTransition) {
+        lines.push(ds_wire.dataLine(ds_const.DL_USE_VIEW_TRANSITION, "true"));
+    }
+    if (opts.viewTransitionSelector != "") {
+        lines.push(ds_wire.dataLine(ds_const.DL_VIEW_TRANSITION_SEL, opts.viewTransitionSelector));
+    }
+
+    let parts = string.split(elements, "\n");
+    let i = 0;
+    while (i < parts.size()) {
+        lines.push(ds_wire.dataLine(ds_const.DL_ELEMENTS, parts.get(i) ?? ""));
+        i = i + 1;
+    }
+    return lines;
+}
+
+/// Builds the `data:` body lines for a `remove-elements` SSE event.
+///
+/// Emits exactly two lines: the target `selector`, and the mode set to
+/// `ds_const.MODE_REMOVE`, which tells the client to delete every element that
+/// matches the selector. No HTML payload is carried, since removal needs none.
+pub fn removeElementLines(selector: string): List<string> {
+    let lines = List<string>();
+    lines.push(ds_wire.dataLine(ds_const.DL_SELECTOR, selector));
+    lines.push(ds_wire.dataLine(ds_const.DL_MODE, ds_const.MODE_REMOVE));
+    return lines;
+}
+
+/// Wraps JavaScript source in a `<script>` tag suitable for element patching.
+///
+/// When `autoRemove` is true, the tag carries `data-effect="el.remove()"`, so
+/// once the script has been inserted and run, Datastar removes the `<script>`
+/// node again, leaving the DOM clean of one-shot scripts. When false the tag is
+/// left in place. The returned HTML is meant to be fed to
+/// [`patchElementsLines`] as the `elements` payload, usually paired with
+/// [`scriptOptions`] so it is appended to `body`.
+pub fn scriptElement(scriptSource: string, autoRemove: bool): string {
+    return scriptElementWith(scriptSource, autoRemove, List<string>());
+}
+
+/// Wraps JavaScript in a `<script>` tag with extra attributes, matching the
+/// datastar-go `WithExecuteScriptAttributes` option.
+///
+/// Each entry of `attributes` is a raw attribute string (for example
+/// `type="module"` or `nonce="abc"`) and is written verbatim into the opening
+/// tag, space-separated, in order, BEFORE the auto-remove effect. When
+/// `autoRemove` is true the tag then carries `data-effect="el.remove()"` so the
+/// node deletes itself after running, exactly as datastar-go does. This is the
+/// general form that [`scriptElement`] delegates to with no extra attributes.
+pub fn scriptElementWith(scriptSource: string, autoRemove: bool, attributes: List<string>): string {
+    let sb = string_builder.StringBuilder();
+    sb.append("<script");
+    let i = 0;
+    while (i < attributes.size()) {
+        sb.append(" ");
+        sb.append(attributes.get(i) ?? "");
+        i = i + 1;
+    }
+    if (autoRemove) {
+        sb.append(" data-effect=\"el.remove()\"");
+    }
+    sb.append(">");
+    sb.append(scriptSource);
+    sb.append("</script>");
+    let out = sb.toString();
+    sb.delete();
+    return out;
+}
+
+/// Options that append a script (or any markup) to the document `body`.
+///
+/// Sets the selector to `body` and the mode to `ds_const.MODE_APPEND`, the
+/// natural target for a `<script>` produced by [`scriptElement`], since a script
+/// runs wherever it lands and appending to the body keeps the rest of the page
+/// untouched.
+pub fn scriptOptions(): PatchElementOptions {
+    let o = PatchElementOptions.defaults();
+    o.selector = "body";
+    o.mode = ds_const.MODE_APPEND;
+    return o;
+}
+
+/// Renders a Kyte string as a double-quoted JavaScript string literal.
+///
+/// Wraps the text in `"` and escapes the characters that would otherwise break
+/// out of the literal or its surrounding line: a double quote (byte 34) becomes
+/// `\"`, a backslash (byte 92) becomes `\\`, a newline (byte 10) becomes `\n`,
+/// and a carriage return (byte 13) becomes `\r`. All other bytes are copied
+/// through unchanged. Use this to safely embed a runtime value into JavaScript
+/// built for [`scriptElement`]. Note this escapes for a JS string context only;
+/// it does not HTML-escape, so do not rely on it to neutralise `</script>`
+/// inside the surrounding tag.
+pub fn jsQuote(s: string): string {
+    let sb = string_builder.StringBuilder();
+    sb.append("\"");
+    let i = 0;
+    while (i < s.length) {
+        let ch = s[i];
+        if (ch == 34) {
+            sb.append("\\\"");
+        } else if (ch == 92) {
+            sb.append("\\\\");
+        } else if (ch == 10) {
+            sb.append("\\n");
+        } else if (ch == 13) {
+            sb.append("\\r");
+        } else {
+            sb.appendChar(ch);
+        }
+        i = i + 1;
+    }
+    sb.append("\"");
+    let out = sb.toString();
+    sb.delete();
+    return out;
+}

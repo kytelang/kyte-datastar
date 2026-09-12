@@ -1,0 +1,253 @@
+//! Datastar Server-Sent Events (SSE) driver: the public face of kyte-datastar.
+//!
+//! Datastar is a hypermedia framework where the server drives the browser by
+//! streaming events over a long-lived SSE response. The browser holds one open
+//! connection and the server pushes small, named events down it: patch this DOM
+//! fragment, update these reactive signals, run this script, redirect. This
+//! file is the ergonomic entry point that a Kyte web handler actually calls; it
+//! turns those high-level intents into the exact wire frames the Datastar
+//! client library understands.
+//!
+//! The design is a thin, protocol-aware wrapper over a SINK. All the byte-level
+//! work is split out into focused modules so this file stays a readable list of
+//! verbs:
+//!
+//!   - `ds_wire` builds a raw SSE frame (the `event:` / `data:` / `id:` /
+//!     `retry:` lines plus the blank-line terminator).
+//!   - `ds_elements` renders the `data:` payload lines for element patches,
+//!     script execution, and the JS-quoting used by redirects.
+//!   - `ds_signals` renders the payload lines for reactive-signal patches.
+//!   - `ds_const` holds the Datastar event-type names and protocol defaults.
+//!   - `ds_sink` is the output abstraction: either a live async socket
+//!     (`StreamSink` over an `aio.AsyncStream`) or an in-memory `BufferSink`
+//!     used for tests and for buffering a whole response before flushing.
+//!
+//! Keeping the sink behind `ds_sink.SseSink` is the key decision here: the same
+//! `Sse` verbs work whether the events go straight out over a keep-alive socket
+//! or are captured into a buffer, so handlers and tests share one code path.
+//! Every send is `async` because the underlying write may suspend on socket
+//! back-pressure, and each returns the `int` byte count the sink reported so a
+//! caller can track how much was flushed.
+
+import string;
+import list;
+import net.aio;
+import ds_const;
+import ds_wire;
+import ds_elements;
+import ds_signals;
+import ds_sink;
+import serde.json;
+
+/// A Datastar SSE stream: the handle a web handler uses to push events.
+///
+/// An `Sse` owns nothing but its [`Sse.sink`]; it is a small value wrapper that
+/// translates high-level calls (patch elements, patch signals, run a script,
+/// redirect) into SSE wire frames and writes them through the sink. Construct
+/// one with [`Sse.overStream`] for a live connection or [`Sse.overBuffer`] to
+/// capture output, then call [`Sse.writeHeaders`] once before sending events.
+pub struct Sse {
+    /// The output the frames are written to, abstracted over a live socket or an
+    /// in-memory buffer. See [`Sse.overStream`] and [`Sse.overBuffer`].
+    pub sink: ds_sink.SseSink,
+
+    /// Wraps an already-constructed sink. Prefer the [`Sse.overStream`] and
+    /// [`Sse.overBuffer`] factories, which build the right sink for you.
+    init(sink: ds_sink.SseSink) {
+        self.sink = sink;
+    }
+
+    /// Creates an `Sse` that writes events straight out over a live async
+    /// socket.
+    ///
+    /// Use this for a real SSE response: the events are streamed to the browser
+    /// as they are sent, over the keep-alive connection `s`. The stream must
+    /// stay open for the lifetime of the `Sse`.
+    pub fn overStream(s: aio.AsyncStream): Sse {
+        return Sse(ds_sink.StreamSink(s));
+    }
+
+    /// Creates an `Sse` over the `aio.AsyncIO` trait rather than a concrete
+    /// `AsyncStream`.
+    ///
+    /// This is the constructor a web framework uses when its streaming route
+    /// hands the handler the connection as an `AsyncIO` (for example Kyte's
+    /// `web.app` `App.sse` API, which also covers TLS-wrapped connections).
+    pub fn overStreamIO(io: aio.AsyncIO): Sse {
+        return Sse(ds_sink.IoSink(io));
+    }
+
+    /// Creates an `Sse` that captures events into an in-memory buffer.
+    ///
+    /// Use this to build up a whole response before flushing it, or in tests
+    /// where you want to assert on the exact bytes produced rather than open a
+    /// socket.
+    pub fn overBuffer(buf: ds_sink.BufferSink): Sse {
+        return Sse(buf);
+    }
+
+    /// Writes the HTTP response head that opens the SSE stream, once, up front.
+    ///
+    /// Sends `200 OK` with `Content-Type: text/event-stream` plus the
+    /// `no-cache` and `keep-alive` headers Datastar needs so the browser treats
+    /// the connection as a long-lived event stream rather than a normal
+    /// response. Call this exactly once, before any [`Sse.send`], and only when
+    /// the sink is a raw socket (a framework that has already written its own
+    /// response head should skip it). Returns the byte count the sink reported.
+    pub async fn writeHeaders(self: Sse): int {
+        return await self.sink.writeChunk(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+        );
+    }
+
+    /// Builds and writes one raw SSE frame, the primitive every other verb
+    /// funnels through.
+    ///
+    /// `eventType` is the Datastar event name (see `ds_const`), `dataLines` are
+    /// the already-rendered `data:` payload lines, `eventId` sets the SSE `id:`
+    /// field (empty to omit it, which lets the browser track `Last-Event-ID`),
+    /// and `retryMs` sets the reconnection `retry:` hint. The frame layout is
+    /// produced by [`ds_wire.buildFrame`]; the bytes are handed to the sink and
+    /// the reported byte count is returned.
+    pub async fn send(self: Sse, eventType: string, dataLines: List<string>, eventId: string, retryMs: int): int {
+        let frame = ds_wire.buildFrame(eventType, dataLines, eventId, retryMs);
+        return await self.sink.writeChunk(frame);
+    }
+
+    /// Patches DOM elements into the page, with full control over the options.
+    ///
+    /// Renders `elements` (a fragment of HTML) into Datastar patch-element
+    /// `data:` lines using `opts` (merge mode, target selector, view-transition,
+    /// and the per-event `eventId` / `retryMs`), then sends them as a
+    /// patch-elements event. The client applies the fragment according to the
+    /// options. For the common case use [`Sse.patchElementsSimple`].
+    pub async fn patchElements(self: Sse, elements: string, opts: ds_elements.PatchElementOptions): int {
+        let lines = ds_elements.patchElementsLines(elements, opts);
+        return await self.send(ds_const.EVENT_PATCH_ELEMENTS, lines, opts.eventId, opts.retryMs);
+    }
+
+    /// Patches DOM elements using the default options.
+    ///
+    /// A convenience over [`Sse.patchElements`] that applies
+    /// `PatchElementOptions.defaults()`, i.e. the standard merge behaviour with
+    /// no explicit selector, event id, or retry override. Use this when the
+    /// fragment carries its own `id` and you just want it merged in.
+    pub async fn patchElementsSimple(self: Sse, elements: string): int {
+        return await self.patchElements(elements, ds_elements.PatchElementOptions.defaults());
+    }
+
+    /// Removes the element(s) matching a CSS selector from the page.
+    ///
+    /// Emitted as a patch-elements event carrying a remove instruction for
+    /// `selector` (see [`ds_elements.removeElementLines`]), so it shares the
+    /// same event type as a normal patch. Uses no event id and the protocol
+    /// default retry.
+    pub async fn removeElement(self: Sse, selector: string): int {
+        let lines = ds_elements.removeElementLines(selector);
+        return await self.send(ds_const.EVENT_PATCH_ELEMENTS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    }
+
+    /// Merges reactive signals into the client-side signal store.
+    ///
+    /// `signalsJson` is a JSON object of signal names to values; the client
+    /// merges it over its current state, overwriting existing keys. To set a
+    /// signal only when it is not already present, use
+    /// [`Sse.patchSignalsIfMissing`] instead. The `false` passed to
+    /// [`ds_signals.patchSignalsLines`] selects overwrite (not if-missing) mode.
+    pub async fn patchSignals(self: Sse, signalsJson: string): int {
+        let lines = ds_signals.patchSignalsLines(signalsJson, false);
+        return await self.send(ds_const.EVENT_PATCH_SIGNALS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    }
+
+    /// Merges reactive signals but only for keys not already set on the client.
+    ///
+    /// Same as [`Sse.patchSignals`] except the `true` flag puts the patch in
+    /// if-missing mode, so existing signal values are preserved and only absent
+    /// keys are added. Useful for seeding initial state without clobbering a
+    /// value the user has since changed.
+    pub async fn patchSignalsIfMissing(self: Sse, signalsJson: string): int {
+        let lines = ds_signals.patchSignalsLines(signalsJson, true);
+        return await self.send(ds_const.EVENT_PATCH_SIGNALS, lines, "", ds_const.DEFAULT_RETRY_MS);
+    }
+
+    /// Merges reactive signals with full control over the per-event options.
+    ///
+    /// The signals-side counterpart to [`Sse.patchElements`]: `opts` carries the
+    /// `onlyIfMissing` flag plus the SSE `eventId` and `retryMs`, matching
+    /// datastar-go's `WithOnlyIfMissing` / `WithPatchSignalsEventID` /
+    /// `WithPatchSignalsRetryDuration` options. The plain [`Sse.patchSignals`]
+    /// and [`Sse.patchSignalsIfMissing`] cover the common cases.
+    pub async fn patchSignalsWith(self: Sse, signalsJson: string, opts: ds_signals.PatchSignalOptions): int {
+        let lines = ds_signals.patchSignalsLines(signalsJson, opts.onlyIfMissing);
+        return await self.send(ds_const.EVENT_PATCH_SIGNALS, lines, opts.eventId, opts.retryMs);
+    }
+
+    /// Serialises a structured [`json.JsonValue`] and merges it as signals.
+    ///
+    /// The Kyte counterpart to datastar-go's `MarshalAndPatchSignals(any)`: Kyte
+    /// has no runtime reflection, so instead of a struct the caller passes a
+    /// `JsonValue` (built with `json.object`/`json.str`/... ), which this
+    /// stringifies correctly (escaping and all) and patches. Use it to avoid
+    /// hand-formatting signal JSON. For if-missing seeding, use
+    /// [`Sse.marshalAndPatchSignalsIfMissing`].
+    pub async fn marshalAndPatchSignals(self: Sse, signals: json.JsonValue): int {
+        return await self.patchSignals(json.stringify(signals));
+    }
+
+    /// Like [`Sse.marshalAndPatchSignals`] but in if-missing mode: existing
+    /// client signal values are preserved and only absent keys are seeded.
+    pub async fn marshalAndPatchSignalsIfMissing(self: Sse, signals: json.JsonValue): int {
+        return await self.patchSignalsIfMissing(json.stringify(signals));
+    }
+
+    /// Runs a snippet of JavaScript in the browser.
+    ///
+    /// Datastar has no dedicated execute-script event; a script is delivered by
+    /// patching a `<script>` element into the page, which the browser then runs.
+    /// This wraps `scriptSource` in that element (with auto-remove ON, so the
+    /// tag deletes itself after executing and does not accumulate in the DOM)
+    /// and patches it in via [`ds_elements.scriptOptions`]. For control over
+    /// auto-remove use [`Sse.executeScriptRaw`].
+    pub async fn executeScript(self: Sse, scriptSource: string): int {
+        let el = ds_elements.scriptElement(scriptSource, true);
+        return await self.patchElements(el, ds_elements.scriptOptions());
+    }
+
+    /// Runs JavaScript in the browser, choosing whether the script tag removes
+    /// itself.
+    ///
+    /// Like [`Sse.executeScript`] but `autoRemove` is explicit: pass `false` to
+    /// leave the injected `<script>` element in the DOM after it runs (for
+    /// example when the element must persist), or `true` to have it clean itself
+    /// up.
+    pub async fn executeScriptRaw(self: Sse, scriptSource: string, autoRemove: bool): int {
+        let el = ds_elements.scriptElement(scriptSource, autoRemove);
+        return await self.patchElements(el, ds_elements.scriptOptions());
+    }
+
+    /// Runs JavaScript in the browser with extra attributes on the `<script>`
+    /// tag.
+    ///
+    /// The full form matching datastar-go's `WithExecuteScriptAttributes`: each
+    /// entry of `attributes` is a raw attribute string (for example
+    /// `type="module"`) written into the injected tag, and `autoRemove` controls
+    /// whether it deletes itself after running. Delivered, like the other script
+    /// verbs, as a patch-elements append to `body` (Datastar has no dedicated
+    /// execute-script event).
+    pub async fn executeScriptWith(self: Sse, scriptSource: string, autoRemove: bool, attributes: List<string>): int {
+        let el = ds_elements.scriptElementWith(scriptSource, autoRemove, attributes);
+        return await self.patchElements(el, ds_elements.scriptOptions());
+    }
+
+    /// Redirects the browser to `url`.
+    ///
+    /// Implemented on top of [`Sse.executeScript`], matching datastar-go's
+    /// `setTimeout(() => window.location.href = "...")` form: the assignment is
+    /// deferred to the next tick so the current SSE response finishes cleanly
+    /// before the navigation aborts the connection. The URL is passed through
+    /// [`ds_elements.jsQuote`] so it is safely encoded as a JavaScript string
+    /// literal, which avoids breaking out of the statement or injecting script.
+    pub async fn redirect(self: Sse, url: string): int {
+        return await self.executeScript("setTimeout(() => window.location.href = " + ds_elements.jsQuote(url) + ")");
+    }
+}
